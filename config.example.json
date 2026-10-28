@@ -1,0 +1,15 @@
+{
+  "bot_qq": "机器人小号的 QQ 号",
+  "owner_qq": "你自己大号的 QQ 号（她认作主人，只用于导入配置包）",
+  "napcat_http_token": "运行 python tools\\setup.py link 后自动填好",
+  "qq_exe": "C:\\Program Files\\Tencent\\QQNT\\QQ.exe",
+  "astrbot_exe": "~\\.local\\bin\\astrbot.exe",
+  "astrbot_dir": "astrbot",
+  "napcat_dir": "napcat",
+  "breeze_dir": "breeze-tts",
+  "breeze_model": "breeze-tts-2-q8_0.gguf",
+  "config_pack_dir": "dafeiyu-config-pack",
+  "import_memory": "0",
+  "import_voice": "1",
+  "icon": "dafeiyu.ico"
+}
