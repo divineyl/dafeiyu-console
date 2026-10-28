@@ -1,0 +1,14 @@
+{
+  "group_probability": {
+    "description": "群聊回复带语音的概率",
+    "type": "float",
+    "hint": "0 到 1。群里人多，语音太多容易吵，建议低一点",
+    "default": 0.2
+  },
+  "private_probability": {
+    "description": "私聊回复带语音的概率",
+    "type": "float",
+    "hint": "0 到 1",
+    "default": 0.4
+  }
+}

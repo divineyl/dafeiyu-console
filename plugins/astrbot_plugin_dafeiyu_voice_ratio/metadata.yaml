@@ -1,0 +1,7 @@
+name: astrbot_plugin_dafeiyu_voice_ratio
+display_name: 大肥鱼语音概率（群聊/私聊分开）
+desc: 群聊和私聊分别设置回复带语音的概率。用的时候把 AstrBot 全局的「语音触发概率」设成 1
+help: 在插件配置里调两个概率；大肥鱼控制台的「群聊和语音」页也能调
+version: v1.0.0
+author: divineyl
+repo: https://github.com/divineyl/dafeiyu-console

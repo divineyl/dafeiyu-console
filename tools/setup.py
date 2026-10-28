@@ -2,7 +2,8 @@
 
 用法（在安装目录下运行，先停掉 AstrBot，改完再用控制台启动）：
   python tools\\setup.py link            连通 NapCat 和 AstrBot：反向 WebSocket + 本机 HTTP 接口，都只听 127.0.0.1、都带随机密钥
-  python tools\\setup.py tts             让 AstrBot 的语音走 Breeze（经辅助服务调语速、换声音），关掉 Edge 语音
+  python tools\\setup.py tts             让 AstrBot 的语音走 Breeze（经辅助服务调语速、换声音），关掉 Edge 语音，
+                                        并装上群聊/私聊分开设语音概率的插件
   python tools\\setup.py group 群号       让她在这个群里潜水聊天（白名单 + 群聊插件只对这个群生效）
   python tools\\setup.py memes           把配置包要的两套表情包下到 memes\\，导入时从本机取，不用等 GitHub
   python tools\\setup.py voices          在 Breeze 里做一批预设声音（要先启动 Breeze）
@@ -125,9 +126,20 @@ def tts(cfg):
                   "openai-tts-voice": "dafeiyu", "timeout": 180, "proxy": ""})
     c["provider"] = provs
     t = c.setdefault("provider_tts_settings", {})
-    t.update({"enable": True, "provider_id": pid})
-    t.setdefault("trigger_probability", 0.33)
+    old_prob = float(t.get("trigger_probability", 0.33))
+    # 群聊、私聊的概率交给 voice_ratio 插件掷，AstrBot 全局那一道放到 100%
+    t.update({"enable": True, "provider_id": pid, "trigger_probability": 1.0})
     save(cp, c)
+
+    astrbot = path_of(cfg, "astrbot_dir", "astrbot")
+    name = "astrbot_plugin_dafeiyu_voice_ratio"
+    shutil.copytree(os.path.join(ROOT, "plugins", name), os.path.join(astrbot, "data", "plugins", name),
+                    dirs_exist_ok=True)
+    vr_path = os.path.join(astrbot, "data", "config", f"{name}_config.json")
+    if not os.path.exists(vr_path):
+        prob = old_prob if old_prob < 1 else 0.33
+        save(vr_path, {"group_probability": prob, "private_probability": prob}, backup=False)
+    print("已装上插件 astrbot_plugin_dafeiyu_voice_ratio：群聊、私聊的语音概率分开设。")
     vs_path = os.path.join(ROOT, "voice-settings.json")
     if not os.path.exists(vs_path):
         save(vs_path, {"voice": "dafeiyu", "speed": 1.2, "labels": {}}, backup=False)

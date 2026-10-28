@@ -63,6 +63,8 @@ CMD_CONFIG = os.path.join(ASTRBOT_DIR, r"data\cmd_config.json")
 GCP_CONFIG = os.path.join(ASTRBOT_DIR, r"data\config\astrbot_plugin_group_chat_plus_config.json")
 QR_PNG = os.path.join(NAPCAT, r"cache\qrcode.png")
 ICON = CFG["icon"]
+VOICE_RATIO_PLUGIN = os.path.join(ASTRBOT_DIR, r"data\plugins\astrbot_plugin_dafeiyu_voice_ratio")
+VOICE_RATIO_CONFIG = os.path.join(ASTRBOT_DIR, r"data\config\astrbot_plugin_dafeiyu_voice_ratio_config.json")
 VOICE_SETTINGS = os.path.join(ROOT, "voice-settings.json")
 VOICE_TMP = os.path.join(ROOT, "voice-candidates")
 SAMPLE_TEXT = "在呢在呢，这么晚还不睡，是不是又在偷偷吃夜宵？"
@@ -255,7 +257,7 @@ class App:
         self.busy = False
         self.status = {}
         root.title("大肥鱼控制台")
-        root.geometry("660x700")
+        root.geometry("660x760")
         root.minsize(560, 560)
         try:
             root.iconbitmap(ICON)
@@ -341,18 +343,28 @@ class App:
             g, c = load_json(GCP_CONFIG), load_json(CMD_CONFIG)
         except (OSError, ValueError):
             g, c = {}, {}
+        try:
+            vr = load_json(VOICE_RATIO_CONFIG)
+        except (OSError, ValueError):
+            vr = {}
+        global_tts = float(c.get("provider_tts_settings", {}).get("trigger_probability", 0.33))
         self.vars = {
             "initial": tk.IntVar(value=round(float(g.get("initial_probability", 0.1)) * 100)),
             "after": tk.IntVar(value=round(float(g.get("after_reply_probability", 0.6)) * 100)),
             "duration": tk.IntVar(value=int(g.get("probability_duration", 120))),
-            "tts": tk.IntVar(value=round(float(c.get("provider_tts_settings", {}).get("trigger_probability", 0.33)) * 100)),
+            "tts_group": tk.IntVar(value=round(float(vr.get("group_probability", global_tts)) * 100)),
+            "tts_private": tk.IntVar(value=round(float(vr.get("private_probability", global_tts)) * 100)),
         }
         rows = [
             ("initial", "潜水时插嘴的概率", 0, 50, "%", "没人喊她时，群友每说一句，她有这么大概率考虑插一句"),
             ("after", "说完话后接话的概率", 0, 100, "%", "她刚说过话后的一段时间里，更容易继续接话"),
             ("duration", "接话状态持续多久", 30, 600, "秒", "过了这段时间就回到潜水状态"),
-            ("tts", "回复用语音的概率", 0, 100, "%", "每条回复有这么大概率同时发语音条"),
+            ("tts_group", "群聊回复用语音的概率", 0, 100, "%", "群里每条回复有这么大概率同时发语音条，人多建议低一点"),
+            ("tts_private", "私聊回复用语音的概率", 0, 100, "%", "私聊每条回复有这么大概率同时发语音条"),
         ]
+        if not os.path.isdir(VOICE_RATIO_PLUGIN):
+            rows[3] = ("tts_group", "群聊回复用语音的概率（没装分开设置的插件，暂时跟私聊一样）", 0, 100, "%",
+                       "运行 python tools\\setup.py tts 装上 astrbot_plugin_dafeiyu_voice_ratio 后才能分开")
         for key, title, lo, hi, unit, hint in rows:
             box = ttk.Frame(f)
             box.pack(fill="x", pady=8)
@@ -671,7 +683,19 @@ class App:
         g["probability_duration"] = int(v["duration"])
         save_json(GCP_CONFIG, g)
         c = load_json(CMD_CONFIG)
-        c.setdefault("provider_tts_settings", {})["trigger_probability"] = round(v["tts"] / 100, 2)
+        tts = c.setdefault("provider_tts_settings", {})
+        if os.path.isdir(VOICE_RATIO_PLUGIN):
+            # 插件按群聊/私聊各掷一次，AstrBot 全局那一道放到 100%，免得概率被乘两遍
+            try:
+                vr = load_json(VOICE_RATIO_CONFIG)
+            except (OSError, ValueError):
+                vr = {}
+            vr["group_probability"] = round(v["tts_group"] / 100, 2)
+            vr["private_probability"] = round(v["tts_private"] / 100, 2)
+            save_json(VOICE_RATIO_CONFIG, vr)
+            tts["trigger_probability"] = 1.0
+        else:
+            tts["trigger_probability"] = round(v["tts_private"] / 100, 2)
         save_json(CMD_CONFIG, c)
         self.start_one(astrbot)
         ok = self.wait_for(BY_KEY["napcat"].connected, 40)

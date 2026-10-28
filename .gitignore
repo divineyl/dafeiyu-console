@@ -9,5 +9,6 @@
 !/dafeiyu_console.pyw
 !/helper.py
 !/tools/
+!/plugins/
 !/docs/
 __pycache__/
