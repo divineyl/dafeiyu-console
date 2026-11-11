@@ -1,0 +1,59 @@
+# 语法检查、导入 helper，以及 tests/ 里的单元测试。
+# 不启动 AstrBot、NapCat 或 Breeze。还没有 tests/**/*.py 时，测试步骤会跳过。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12"]
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile sources
+        run: python -m compileall -q helper.py dafeiyu_console.pyw plugins tools
+
+      - name: Import helper
+        run: python -c "import helper"
+
+      - name: Install a virtual display for Tk unit tests
+        if: ${{ runner.os == 'Linux' && hashFiles('tests/**/*.py') != '' }}
+        run: sudo apt-get update && sudo apt-get install --yes xvfb
+
+      - name: Run unit tests
+        if: ${{ runner.os != 'Linux' && hashFiles('tests/**/*.py') != '' }}
+        run: python -m unittest discover -s tests -v
+
+      - name: Run unit tests on a virtual display
+        if: ${{ runner.os == 'Linux' && hashFiles('tests/**/*.py') != '' }}
+        run: xvfb-run -a python -m unittest discover -s tests -v
