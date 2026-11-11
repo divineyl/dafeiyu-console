@@ -1,0 +1,13 @@
+{
+  "bot_qq": "10001",
+  "owner_qq": "10002",
+  "napcat_http_token": "doctortesthttptoken0001",
+  "qq_exe": "qq/QQ.exe",
+  "astrbot_exe": "astrbot-bin/astrbot.exe",
+  "astrbot_dir": "astrbot",
+  "napcat_dir": "napcat",
+  "breeze_dir": "breeze-tts",
+  "breeze_model": "breeze-tts-2-q8_0.gguf",
+  "config_pack_dir": "dafeiyu-config-pack",
+  "icon": "dafeiyu.ico"
+}

@@ -1,0 +1,21 @@
+{
+  "network": {
+    "websocketClients": [
+      {
+        "name": "astrbot",
+        "enable": true,
+        "url": "ws://127.0.0.1:6199/ws",
+        "token": "doctortestwstoken000001"
+      }
+    ],
+    "httpServers": [
+      {
+        "name": "local-http",
+        "enable": true,
+        "host": "127.0.0.1",
+        "port": 3000,
+        "token": "doctortesthttptoken0001"
+      }
+    ]
+  }
+}
