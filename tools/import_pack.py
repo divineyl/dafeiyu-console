@@ -13,53 +13,90 @@ import json
 import os
 import sys
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-cfg = json.load(open(os.path.join(ROOT, "config.json"), encoding="utf-8-sig"))
-PACK = os.path.join(ROOT, os.path.expanduser(cfg.get("config_pack_dir") or "dafeiyu-config-pack"))
-if not os.path.exists(os.path.join(PACK, "tools", "import_dafeiyu.py")):
-    sys.exit(f"没找到配置包：{PACK}\n先 git clone https://github.com/zexuanw958-svg/dafeiyu-config-pack 到这里，"
-             "或在 config.json 的 config_pack_dir 里写它的位置。")
-if not str(cfg.get("owner_qq", "")).strip():
-    sys.exit("config.json 里的 owner_qq（你自己的大号，她认作主人）还没填。")
 
-sys.path.insert(0, os.path.join(PACK, "tools"))
-os.chdir(PACK)
-import import_dafeiyu as imp  # noqa: E402
+def main(root=None):
+    root = root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg_path = os.path.join(root, "config.json")
+    try:
+        with open(cfg_path, encoding="utf-8-sig") as fh:
+            cfg = json.load(fh)
+    except FileNotFoundError:
+        sys.exit("没找到 config.json。先复制 config.example.json，填好后再运行。")
+    except (OSError, ValueError) as e:
+        sys.exit(f"config.json 读不了：{e}")
+    if not isinstance(cfg, dict):
+        sys.exit("config.json 必须是 JSON 对象。")
 
-answers = {
-    "base_url": "http://127.0.0.1:6185",
-    "username": cfg.get("astrbot_username") or "astrbot",
-    "owner_qq": str(cfg["owner_qq"]).strip(),
-    "memory": str(cfg.get("import_memory", "0")),
-    "voice": str(cfg.get("import_voice", "1")),
-}
-answers_path = os.path.join(ROOT, "logs", "import-answers.json")
-os.makedirs(os.path.dirname(answers_path), exist_ok=True)
-json.dump(answers, open(answers_path, "w", encoding="utf-8"), ensure_ascii=False)
+    pack = os.path.join(root, os.path.expanduser(str(cfg.get("config_pack_dir") or "dafeiyu-config-pack")))
+    if not os.path.exists(os.path.join(pack, "tools", "import_dafeiyu.py")):
+        sys.exit(f"没找到配置包：{pack}\n先 git clone https://github.com/zexuanw958-svg/dafeiyu-config-pack 到这里，"
+                 "或在 config.json 的 config_pack_dir 里写它的位置。")
+    owner = cfg.get("owner_qq")
+    if owner is None or not str(owner).strip():
+        sys.exit("config.json 里的 owner_qq（你自己的大号，她认作主人）还没填。")
 
-_ask = imp.ask
+    tool_path = os.path.join(pack, "tools")
+    sys.path.insert(0, tool_path)
+    previous_cwd = os.getcwd()
+    previous_argv = sys.argv
+    answers_path = os.path.join(root, "logs", "import-answers.json")
+    os.chdir(pack)
+    try:
+        sys.modules.pop("import_dafeiyu", None)
+        import import_dafeiyu as imp  # noqa: E402
+
+        def text(key, default):
+            value = cfg.get(key, default)
+            if value is None or not str(value).strip():
+                value = default
+            return str(value).strip()
+
+        answers = {
+            "base_url": "http://127.0.0.1:6185",
+            "username": text("astrbot_username", "astrbot"),
+            "owner_qq": str(owner).strip(),
+            "memory": text("import_memory", "0"),
+            "voice": text("import_voice", "1"),
+        }
+        os.makedirs(os.path.dirname(answers_path), exist_ok=True)
+        with open(answers_path, "w", encoding="utf-8") as fh:
+            json.dump(answers, fh, ensure_ascii=False)
+
+        _ask = imp.ask
+
+        def ask(name, prompt, default=None, secret=False, choices=None):
+            if name == "password":
+                while True:
+                    value = getpass.getpass("请输入 AstrBot 后台密码（输入时不显示，输完按回车）：").strip()
+                    if value:
+                        return value
+            return _ask(name, prompt, default, secret, choices)
+
+        imp.ask = ask
+        # 本机的表情包源排第一；导入工具发现插件里现在的加速地址在列表里，就会换成第一个
+        local = "http://127.0.0.1:18765/"
+        current = list(getattr(imp, "GH_ACCELERATORS", []))
+        imp.GH_ACCELERATORS = [local] + [a for a in current if a and a != local] + [""]
+        sys.argv = [sys.argv[0], "--answers", answers_path]
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+        imp.main()
+    except KeyboardInterrupt:
+        print("\n已取消")
+    finally:
+        sys.argv = previous_argv
+        os.chdir(previous_cwd)
+        try:
+            sys.path.remove(tool_path)
+        except ValueError:
+            pass
+        try:
+            os.remove(answers_path)
+        except OSError:
+            pass
 
 
-def ask(name, prompt, default=None, secret=False, choices=None):
-    if name == "password":
-        while True:
-            value = getpass.getpass("请输入 AstrBot 后台密码（输入时不显示，输完按回车）：").strip()
-            if value:
-                return value
-    return _ask(name, prompt, default, secret, choices)
-
-
-imp.ask = ask
-# 本机的表情包源排第一；导入工具发现插件里现在的加速地址在列表里，就会换成第一个
-imp.GH_ACCELERATORS = ["http://127.0.0.1:18765/"] + [a for a in imp.GH_ACCELERATORS if a] + [""]
-sys.argv = [sys.argv[0], "--answers", answers_path]
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
-try:
-    imp.main()
-except KeyboardInterrupt:
-    print("\n已取消")
-finally:
-    os.remove(answers_path)
+if __name__ == "__main__":
+    main()
