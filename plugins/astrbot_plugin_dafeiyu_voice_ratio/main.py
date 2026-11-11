@@ -6,6 +6,7 @@ AstrBot 自己只有一个全局的「语音触发概率」。这个插件在消
 AstrBot 没有现成的「单条消息跳过语音」开关，所以这里包了一层 SessionServiceManager.should_process_tts_request，
 看到标记就返回 False，没标记照原样走（包括 /tts 关掉某个会话的语音）。插件停用或卸载时会还原。
 """
+import math
 import random
 
 from astrbot import logger
@@ -42,9 +43,12 @@ def _remove_patch():
 
 def _prob(value, default):
     try:
-        return max(0.0, min(1.0, float(value)))
+        number = float(value)
     except (TypeError, ValueError):
         return default
+    if not math.isfinite(number):
+        return default
+    return max(0.0, min(1.0, number))
 
 
 class DafeiyuVoiceRatio(Star):
