@@ -37,16 +37,35 @@ DEFAULTS = {
     "icon": "dafeiyu.ico",
 }
 
+CONFIG_ERROR = None
+
 
 def load_config():
+    global CONFIG_ERROR
+    CONFIG_ERROR = None
     try:
-        cfg = {**DEFAULTS, **json.load(open(CONFIG_PATH, encoding="utf-8-sig"))}
+        with open(CONFIG_PATH, encoding="utf-8-sig") as fh:
+            loaded = json.load(fh)
+        if not isinstance(loaded, dict):
+            raise ValueError("内容必须是 JSON 对象")
     except FileNotFoundError:
-        cfg = dict(DEFAULTS)
+        loaded = {}
+    except (OSError, ValueError) as e:
+        CONFIG_ERROR = f"config.json 读不了（{e}）。请对照 config.example.json 检查。"
+        loaded = {}
+    cfg = dict(DEFAULTS)
+    for key, value in loaded.items():
+        if value is not None:
+            cfg[key] = value
     for key in ("qq_exe", "astrbot_exe", "astrbot_dir", "napcat_dir", "breeze_dir", "icon"):
-        # 相对路径按安装目录算
-        cfg[key] = os.path.join(ROOT, os.path.expanduser(cfg[key]))
-    cfg["bot_qq"] = str(cfg["bot_qq"]).strip()
+        # 相对路径按安装目录算；空值或 null 退回默认，避免一打开就崩
+        raw = cfg.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            raw = DEFAULTS[key]
+        raw = os.path.expanduser(raw)
+        cfg[key] = raw if os.path.isabs(raw) else os.path.join(ROOT, raw)
+    bot = cfg.get("bot_qq")
+    cfg["bot_qq"] = "" if bot is None else str(bot).strip()
     return cfg
 
 
@@ -77,7 +96,15 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def napcat_token():
-    return CFG["napcat_http_token"]
+    # 控制台开着的时候也可能刚跑完 setup.py link，密钥以文件里的为准
+    try:
+        with open(CONFIG_PATH, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and data.get("napcat_http_token"):
+            return str(data["napcat_http_token"])
+    except (OSError, ValueError):
+        pass
+    return str(CFG.get("napcat_http_token") or "")
 
 
 def port_open(port):
@@ -115,9 +142,10 @@ def runs_file(p, filename):
 
 def kill_tree(proc):
     try:
-        procs = proc.children(recursive=True) + [proc]
+        procs = proc.children(recursive=True)
     except psutil.Error:
-        return
+        procs = []
+    procs.append(proc)
     for p in procs:
         try:
             p.kill()
@@ -155,6 +183,8 @@ class Breeze(Service):
     def start(self):
         exe = next((os.path.join(d, f) for d, _, fs in os.walk(os.path.join(BREEZE, "bin")) for f in fs
                     if f.lower() == "breeze-server.exe"), None)
+        if not exe:
+            raise FileNotFoundError("没找到 breeze-server.exe，请先把 Breeze 装进 breeze-tts\\bin")
         self.spawn([exe, os.path.join(BREEZE, "models", CFG["breeze_model"]), "--host", "127.0.0.1",
                     "--port", "8137", "--voices-dir", os.path.join(BREEZE, "voices"), "--ws-port", "-1", "--webui"],
                    BREEZE)
@@ -197,10 +227,20 @@ class NapCat(Service):
         out = []
         for p in psutil.process_iter(["name"]):
             name = (p.info["name"] or "").lower()
-            line = cmdline(p)
-            # 只认 NapCat 拉起的那个 QQ（带 -q 小号），不碰你自己平时开的 QQ
-            if name == "napcatwinbootmain.exe" or (name == "qq.exe" and f"-q {BOT_QQ}" in line
-                                                  and "--type=" not in line):
+            if name == "napcatwinbootmain.exe":
+                out.append(p)
+                continue
+            # 只认 NapCat 拉起的那个 QQ（-q 后面正好是小号），不碰你自己平时开的 QQ
+            if name != "qq.exe" or not BOT_QQ:
+                continue
+            try:
+                args = p.cmdline()
+            except (psutil.Error, OSError):
+                continue
+            if any(str(a).startswith("--type=") for a in args):
+                continue
+            if any(args[i] == "-q" and i + 1 < len(args) and str(args[i + 1]) == BOT_QQ
+                   for i in range(len(args))):
                 out.append(p)
         return out
 
@@ -242,13 +282,22 @@ BY_KEY = {s.key: s for s in SERVICES}
 
 
 def load_json(path):
-    return json.load(open(path, encoding="utf-8-sig"))
+    with open(path, encoding="utf-8-sig") as fh:
+        return json.load(fh)
 
 
 def save_json(path, data):
     tmp = path + ".tmp"
-    json.dump(data, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 class App:
@@ -343,17 +392,33 @@ class App:
             g, c = load_json(GCP_CONFIG), load_json(CMD_CONFIG)
         except (OSError, ValueError):
             g, c = {}, {}
+        if not isinstance(g, dict):
+            g = {}
+        if not isinstance(c, dict):
+            c = {}
         try:
             vr = load_json(VOICE_RATIO_CONFIG)
         except (OSError, ValueError):
             vr = {}
-        global_tts = float(c.get("provider_tts_settings", {}).get("trigger_probability", 0.33))
+        if not isinstance(vr, dict):
+            vr = {}
+
+        def num(data, key, default):
+            try:
+                return float(data.get(key, default))
+            except (TypeError, ValueError, AttributeError):
+                return float(default)
+
+        tts_cfg = c.get("provider_tts_settings")
+        if not isinstance(tts_cfg, dict):
+            tts_cfg = {}
+        global_tts = num(tts_cfg, "trigger_probability", 0.33)
         self.vars = {
-            "initial": tk.IntVar(value=round(float(g.get("initial_probability", 0.1)) * 100)),
-            "after": tk.IntVar(value=round(float(g.get("after_reply_probability", 0.6)) * 100)),
-            "duration": tk.IntVar(value=int(g.get("probability_duration", 120))),
-            "tts_group": tk.IntVar(value=round(float(vr.get("group_probability", global_tts)) * 100)),
-            "tts_private": tk.IntVar(value=round(float(vr.get("private_probability", global_tts)) * 100)),
+            "initial": tk.IntVar(value=round(num(g, "initial_probability", 0.1) * 100)),
+            "after": tk.IntVar(value=round(num(g, "after_reply_probability", 0.6) * 100)),
+            "duration": tk.IntVar(value=int(num(g, "probability_duration", 120))),
+            "tts_group": tk.IntVar(value=round(num(vr, "group_probability", global_tts) * 100)),
+            "tts_private": tk.IntVar(value=round(num(vr, "private_probability", global_tts) * 100)),
         }
         rows = [
             ("initial", "潜水时插嘴的概率", 0, 50, "%", "没人喊她时，群友每说一句，她有这么大概率考虑插一句"),
@@ -365,6 +430,8 @@ class App:
         if not os.path.isdir(VOICE_RATIO_PLUGIN):
             rows[3] = ("tts_group", "群聊回复用语音的概率（没装分开设置的插件，暂时跟私聊一样）", 0, 100, "%",
                        "运行 python tools\\setup.py tts 装上 astrbot_plugin_dafeiyu_voice_ratio 后才能分开")
+            # 两个滑块绑在同一个值上，拖任何一个都会一起动，保存时也不会丢掉群聊那一格
+            self.vars["tts_group"] = self.vars["tts_private"]
         for key, title, lo, hi, unit, hint in rows:
             box = ttk.Frame(f)
             box.pack(fill="x", pady=8)
@@ -462,7 +529,10 @@ class App:
                 ids = [v["id"] for v in json.loads(self.breeze("GET", "/v1/voices", timeout=5)) if v.get("saved")]
             except Exception:
                 ids = None
-            self.root.after(0, lambda: self.show_voices(ids))
+            try:
+                self.root.after(0, lambda ids=ids: self.show_voices(ids))
+            except (tk.TclError, RuntimeError):
+                return
         threading.Thread(target=work, daemon=True).start()
 
     def show_voices(self, ids):
@@ -495,8 +565,8 @@ class App:
         body = json.dumps({"model": "tts-1", "voice": voice, "keep_voice": True, "input": text,
                            "response_format": "wav", "speed": round(self.speed.get(), 2)}).encode()
         req = urllib.request.Request("http://127.0.0.1:8138/v1/audio/speech", body, {"Content-Type": "application/json"})
-        with NO_PROXY.open(req, timeout=600) as r:
-            open(out, "wb").write(r.read())
+        with NO_PROXY.open(req, timeout=600) as r, open(out, "wb") as fh:
+            fh.write(r.read())
 
     def use_voice(self):
         vid = self.selected_voice()
@@ -573,13 +643,15 @@ class App:
 
     def save_candidate(self, path, desc):
         name = self.new_name.get().strip() or desc[:8]
-        vid = "v" + time.strftime("%m%d%H%M%S")
+        vid = time.strftime("v%m%d%H%M%S") + f"{random.randint(0, 999):03d}"
         b = uuid.uuid4().hex
         parts = b"".join(f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
                          for k, v in (("ref_text", DESIGN_TEXT), ("name", vid), ("description", desc)))
         head = (f"--{b}\r\nContent-Disposition: form-data; name=\"ref_audio\"; filename=\"ref.wav\"\r\n"
                 "Content-Type: application/octet-stream\r\n\r\n").encode()
-        body = parts + head + open(path, "rb").read() + f"\r\n--{b}--\r\n".encode()
+        with open(path, "rb") as fh:
+            audio = fh.read()
+        body = parts + head + audio + f"\r\n--{b}--\r\n".encode()
         self.breeze("POST", "/v1/voices", body, f"multipart/form-data; boundary={b}", timeout=120)
         vs = self.voice_settings()
         vs.setdefault("labels", {})[vid] = name
@@ -604,8 +676,16 @@ class App:
         s = BY_KEY[self.log_choice.get()]
         try:
             with open(s.log, "rb") as fh:
-                fh.seek(max(0, os.path.getsize(s.log) - 60000))
-                text = ANSI.sub("", fh.read().decode("utf-8", "replace"))
+                size = os.path.getsize(s.log)
+                start = max(0, size - 60000)
+                fh.seek(start)
+                data = fh.read()
+            # 从文件中间切开时丢掉半行，也躲开切在半个汉字上的乱码
+            if start and data:
+                newline = data.find(b"\n")
+                if newline >= 0:
+                    data = data[newline + 1:]
+            text = ANSI.sub("", data.decode("utf-8", "replace"))
         except OSError:
             text = "（还没有日志，用控制台启动后才会有）"
         at_bottom = self.log_text.yview()[1] > 0.98
@@ -613,7 +693,13 @@ class App:
         self.log_text.insert("end", text)
         if at_bottom:
             self.log_text.see("end")
-        self.root.after(3000, self.refresh_log)
+        job = getattr(self, "_log_after", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        self._log_after = self.root.after(3000, self.refresh_log)
 
     # ---------- 动作 ----------
     def say(self, text, color="#1a6"):
@@ -674,29 +760,49 @@ class App:
 
     def apply_settings(self):
         v = {k: var.get() for k, var in self.vars.items()}
-        astrbot = BY_KEY["astrbot"]
-        self.say("正在保存设置，AstrBot 会重启一下…", "#555")
-        astrbot.stop()
-        g = load_json(GCP_CONFIG)
+        try:
+            g = load_json(GCP_CONFIG)
+            c = load_json(CMD_CONFIG)
+        except (OSError, ValueError) as e:
+            self.say(f"配置没读成功，什么都没改：{e}", "#c33")
+            return
+        if not isinstance(g, dict) or not isinstance(c, dict):
+            self.say("配置格式不对，什么都没改", "#c33")
+            return
         g["initial_probability"] = round(v["initial"] / 100, 2)
         g["after_reply_probability"] = round(v["after"] / 100, 2)
         g["probability_duration"] = int(v["duration"])
-        save_json(GCP_CONFIG, g)
-        c = load_json(CMD_CONFIG)
-        tts = c.setdefault("provider_tts_settings", {})
+        tts = c.get("provider_tts_settings")
+        if not isinstance(tts, dict):
+            tts = {}
+        c["provider_tts_settings"] = tts
+        vr = None
         if os.path.isdir(VOICE_RATIO_PLUGIN):
             # 插件按群聊/私聊各掷一次，AstrBot 全局那一道放到 100%，免得概率被乘两遍
             try:
                 vr = load_json(VOICE_RATIO_CONFIG)
             except (OSError, ValueError):
                 vr = {}
+            if not isinstance(vr, dict):
+                vr = {}
             vr["group_probability"] = round(v["tts_group"] / 100, 2)
             vr["private_probability"] = round(v["tts_private"] / 100, 2)
-            save_json(VOICE_RATIO_CONFIG, vr)
             tts["trigger_probability"] = 1.0
         else:
             tts["trigger_probability"] = round(v["tts_private"] / 100, 2)
-        save_json(CMD_CONFIG, c)
+        astrbot = BY_KEY["astrbot"]
+        self.say("正在保存设置，AstrBot 会重启一下…", "#555")
+        astrbot.stop()
+        try:
+            save_json(GCP_CONFIG, g)
+            save_json(CMD_CONFIG, c)
+            if vr is not None:
+                os.makedirs(os.path.dirname(VOICE_RATIO_CONFIG), exist_ok=True)
+                save_json(VOICE_RATIO_CONFIG, vr)
+        except OSError as e:
+            self.say(f"保存失败，正在把 AstrBot 拉起来：{e}", "#c33")
+            self.start_one(astrbot)
+            return
         self.start_one(astrbot)
         ok = self.wait_for(BY_KEY["napcat"].connected, 40)
         self.say("设置已生效 ✔" if ok else "设置已保存，但 QQ 还没重新连上，看看日志", "#1a6" if ok else "#c80")
@@ -706,9 +812,13 @@ class App:
             ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($args[0]);"
                   "$s.TargetPath=$args[1];$s.Arguments=$args[2];$s.WorkingDirectory=$args[3];"
                   "$s.IconLocation=$args[4];$s.Save()")
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps, STARTUP_LNK, sys.executable,
-                            f'"{os.path.abspath(__file__)}" --autostart', os.path.dirname(__file__), ICON],
-                           creationflags=NO_WINDOW)
+            result = subprocess.run(["powershell", "-NoProfile", "-Command", ps, STARTUP_LNK, sys.executable,
+                                     f'"{os.path.abspath(__file__)}" --autostart', os.path.dirname(__file__), ICON],
+                                    creationflags=NO_WINDOW)
+            if result.returncode != 0 or not os.path.exists(STARTUP_LNK):
+                self.autostart_var.set(False)
+                self.say("开机自启没设上，可以再点一次试试", "#c33")
+                return
             self.say("已设置开机自动启动")
         else:
             try:
@@ -751,9 +861,21 @@ class App:
             nap = BY_KEY["napcat"]
             st["connected"] = nap.connected()
             st["login"] = nap.login_info() if st["connected"] else {}
-            self.root.after(0, lambda: self.show_status(st))
+            try:
+                self.root.after(0, lambda: self.show_status(st))
+            except (tk.TclError, RuntimeError):
+                return
         threading.Thread(target=work, daemon=True).start()
-        self.root.after(3000, self.poll)
+        job = getattr(self, "_poll_after", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+        try:
+            self._poll_after = self.root.after(3000, self.poll)
+        except tk.TclError:
+            self._poll_after = None
 
     def show_status(self, st):
         for s in SERVICES:
@@ -765,8 +887,11 @@ class App:
             self.dots[s.key].config(fg=color)
             self.states[s.key].config(text=text)
         login = st.get("login") or {}
-        if st["connected"] and login:
-            self.qq_label.config(text=f"QQ：{login.get('nickname')}（{login.get('user_id')}）在线 · 群聊和私聊都在听")
+        if st["connected"] and login.get("user_id"):
+            nickname = login.get("nickname") or "已登录"
+            self.qq_label.config(text=f"QQ：{nickname}（{login.get('user_id')}）在线 · 群聊和私聊都在听")
+        elif st["connected"]:
+            self.qq_label.config(text="QQ：已连接")
         else:
             self.qq_label.config(text="QQ：未连接")
         all_up = all(st[s.key] for s in SERVICES) and st["connected"]
@@ -780,6 +905,14 @@ class App:
             return
         if ans:
             self.stop_all()
+        for attr in ("_log_after", "_poll_after"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
         self.root.destroy()
 
 
@@ -788,15 +921,26 @@ def main():
     try:
         lock.bind(("127.0.0.1", 18799))
     except OSError:
+        lock.close()
         tk.Tk().withdraw()
         messagebox.showinfo("大肥鱼控制台", "控制台已经开着了，看看任务栏。")
         return
-    if not BOT_QQ:
+
+    def give_up(kind, text):
+        # 还没进主循环就要退出时，马上放开单实例端口，否则下次打开会误以为控制台已经在跑
+        lock.close()
         tk.Tk().withdraw()
-        messagebox.showwarning("大肥鱼控制台", "还没配置：把 config.example.json 复制成 config.json，"
-                                               "至少填上 bot_qq（机器人小号）再打开。")
+        kind("大肥鱼控制台", text)
+
+    if CONFIG_ERROR:
+        give_up(messagebox.showwarning, CONFIG_ERROR)
+        return
+    if not BOT_QQ:
+        give_up(messagebox.showwarning, "还没配置：把 config.example.json 复制成 config.json，"
+                                        "至少填上 bot_qq（机器人小号）再打开。")
         return
     root = tk.Tk()
+    root._instance_lock = lock  # 挂在窗口上，关掉之前不要被回收
     App(root, "--autostart" in sys.argv)
     root.mainloop()
 
