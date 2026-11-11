@@ -1,0 +1,22 @@
+{
+  "dashboard": {"host": "127.0.0.1", "port": 6185},
+  "platform": [
+    {
+      "id": "qq",
+      "type": "aiocqhttp",
+      "enable": true,
+      "ws_reverse_host": "127.0.0.1",
+      "ws_reverse_port": 6199,
+      "ws_reverse_token": "doctortestwstoken000001"
+    }
+  ],
+  "provider": [
+    {
+      "id": "大肥鱼语音-Breeze",
+      "type": "openai_tts_api",
+      "enable": true,
+      "api_key": "doctortestapikey000001",
+      "api_base": "http://127.0.0.1:8138/v1"
+    }
+  ]
+}

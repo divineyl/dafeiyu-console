@@ -1,0 +1,14 @@
+# 这些文件只要在，内容可以为空。体检不运行它们。
+qq/QQ.exe
+astrbot-bin/astrbot.exe
+dafeiyu.ico
+memes/.keep
+breeze-tts/bin/win/breeze-server.exe
+breeze-tts/models/breeze-tts-2-q8_0.gguf
+breeze-tts/voices/.keep
+napcat/NapCatWinBootMain.exe
+napcat/NapCatWinBootHook.dll
+napcat/loadNapCat.js
+napcat/napcat.mjs
+napcat/qqnt.json
+dafeiyu-config-pack/.keep
