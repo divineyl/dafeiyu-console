@@ -42,9 +42,13 @@ def _remove_patch():
 
 def _prob(value, default):
     try:
-        return max(0.0, min(1.0, float(value)))
+        number = float(value)
     except (TypeError, ValueError):
         return default
+    # NaN、无穷大不能拿去掷骰子，否则群聊会变成「每条都发语音」
+    if number != number or number in (float("inf"), float("-inf")):
+        return default
+    return max(0.0, min(1.0, number))
 
 
 class DafeiyuVoiceRatio(Star):
