@@ -26,6 +26,7 @@
 - `setup.py group 群号`：让她在某个群潜水聊天
 - `setup.py memes` / `setup.py voices` / `setup.py shortcut`：下表情包、做 12 个预设声音、放桌面快捷方式
 - `import_pack.py`：跑配置包的导入工具，除后台密码外的问题都按 `config.json` 自动回答，表情包从本机取
+- `doctor.py`：检查 Breeze 语音、辅助服务、AstrBot、QQ/NapCat 的路径和端口。只打印报告，不启动、不停止、不改文件，也不去连配置里的地址。在安装目录运行 `python tools\doctor.py`
 
 ## 架构
 
