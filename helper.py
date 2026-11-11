@@ -36,9 +36,11 @@ FFMPEG = find_ffmpeg()
 
 def load_settings():
     try:
-        return json.load(open(SETTINGS, encoding="utf-8-sig"))
+        with open(SETTINGS, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
     except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def wav_header(n_bytes):
@@ -48,6 +50,8 @@ def wav_header(n_bytes):
 
 def ffmpeg_pcm(pcm, speed, out_args):
     """24k 单声道 s16 PCM 进，按 out_args 出；speed != 1 时用 atempo 变速不变调。"""
+    if not FFMPEG:
+        raise RuntimeError("找不到 ffmpeg，装好后才能变速或转换格式")
     args = [FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", "pipe:0"]
     if abs(speed - 1.0) > 0.01:
         args += ["-filter:a", f"atempo={speed:.2f}"]
@@ -57,10 +61,29 @@ def ffmpeg_pcm(pcm, speed, out_args):
     return r.stdout
 
 
+def resolve_meme_zip(url_path):
+    """把 /<仓库>/archive/<版本>.zip 映射到 memes 目录里的压缩包，并且不许跳出这个目录。"""
+    clean = url_path.split("?", 1)[0].split("#", 1)[0]
+    m = re.search(r"/([^/]+)/archive/(?:refs/tags/)?([^/]+)\.zip$", clean)
+    if not m:
+        return None
+    repo, ref = m.group(1), m.group(2)
+    # 「..」和反斜杠拼进文件名后，在 Windows 上会被当成上级目录
+    if any(part in (".", "..") or "\\" in part or ".." in part for part in (repo, ref)):
+        return None
+    root = os.path.realpath(MEMES)
+    full = os.path.realpath(os.path.join(root, f"{repo}-{ref}.zip"))
+    try:
+        if os.path.commonpath([full, root]) != root:
+            return None
+    except ValueError:
+        return None
+    return full
+
+
 class MemeHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        m = re.search(r"/([^/]+)/archive/(?:refs/tags/)?([^/]+)\.zip$", self.path)
-        path = m and os.path.join(MEMES, f"{m.group(1)}-{m.group(2)}.zip")
+        path = resolve_meme_zip(self.path)
         if not path or not os.path.isfile(path):
             self.send_error(404)
             return
@@ -75,22 +98,40 @@ class MemeHandler(http.server.BaseHTTPRequestHandler):
 
 class VoiceHandler(http.server.BaseHTTPRequestHandler):
     def reply(self, code, body, ctype):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def fail(self, code, message):
+        self.reply(code, json.dumps({"error": message}, ensure_ascii=False), "application/json")
+
+    def read_len(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            return None
+        return n if n >= 0 else None
+
     def passthrough(self, method):
-        n = int(self.headers.get("Content-Length") or 0)
-        req = urllib.request.Request(BREEZE + self.path, self.rfile.read(n) if n else None, method=method)
+        n = self.read_len()
+        if n is None:
+            self.fail(400, "Content-Length 不合法")
+            return
+        data = self.rfile.read(n) if n else None
+        req = urllib.request.Request(BREEZE + self.path, data, method=method)
         if self.headers.get("Content-Type"):
             req.add_header("Content-Type", self.headers["Content-Type"])
         try:
             with OPENER.open(req, timeout=600) as r:
                 self.reply(r.status, r.read(), r.headers.get("Content-Type", "application/json"))
         except urllib.error.HTTPError as e:
-            self.reply(e.code, e.read(), "application/json")
+            self.reply(e.code, e.read(), e.headers.get("Content-Type", "application/json"))
+        except urllib.error.URLError as e:
+            self.fail(502, f"连不上 Breeze：{e.reason}")
 
     def do_GET(self):
         self.passthrough("GET")
@@ -98,14 +139,43 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.passthrough("DELETE")
 
+    def parse_speed(self, body, settings):
+        raw = body.pop("speed") if "speed" in body else None
+        if raw is None or raw == "":
+            raw = settings.get("speed", 1.0)
+        if raw is None or raw == "":
+            raw = 1.0
+        speed = float(raw)
+        # 0 和 NaN 以前会被当成「没填」悄悄换成 1，ffmpeg 也接受不了负数
+        if speed != speed or speed in (float("inf"), float("-inf")) or speed <= 0:
+            raise ValueError("语速不合法")
+        return speed
+
     def do_POST(self):
-        if not self.path.rstrip("/").endswith("/audio/speech"):
+        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        if not path.rstrip("/").endswith("/audio/speech"):
             self.passthrough("POST")
             return
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        n = self.read_len()
+        if n is None:
+            self.fail(400, "Content-Length 不合法")
+            return
+        raw_body = self.rfile.read(n) if n else b""
+        try:
+            body = json.loads(raw_body or b"{}")
+        except ValueError:
+            self.fail(400, "请求体不是 JSON")
+            return
+        if not isinstance(body, dict):
+            self.fail(400, "请求体必须是 JSON 对象")
+            return
         s = load_settings()
         fmt = body.get("response_format") or "wav"
-        speed = float(body.pop("speed", None) or s.get("speed") or 1.0)
+        try:
+            speed = self.parse_speed(body, s)
+        except (TypeError, ValueError):
+            self.fail(400, "语速不合法")
+            return
         if s.get("voice") and not body.get("keep_voice"):
             body["voice"] = s["voice"]
         body.pop("keep_voice", None)
@@ -116,7 +186,10 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
             with OPENER.open(req, timeout=600) as r:
                 pcm = r.read()
         except urllib.error.HTTPError as e:
-            self.reply(e.code, e.read(), "application/json")
+            self.reply(e.code, e.read(), e.headers.get("Content-Type", "application/json"))
+            return
+        except urllib.error.URLError as e:
+            self.fail(502, f"连不上 Breeze：{e.reason}")
             return
         try:
             if abs(speed - 1.0) > 0.01:
@@ -128,7 +201,7 @@ class VoiceHandler(http.server.BaseHTTPRequestHandler):
             else:
                 out, ctype = ffmpeg_pcm(pcm, 1.0, ["-f", fmt]), f"audio/{fmt}"
         except Exception as e:
-            self.reply(500, json.dumps({"error": str(e)}).encode(), "application/json")
+            self.fail(500, str(e))
             return
         self.reply(200, out, ctype)
 
