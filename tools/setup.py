@@ -16,6 +16,8 @@ import secrets
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import wave
@@ -25,6 +27,24 @@ CONFIG_PATH = os.path.join(ROOT, "config.json")
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 BREEZE = "http://127.0.0.1:8137"
 GH_ACCELERATORS = ["https://gh.dpik.top/", "https://gh-proxy.com/", "https://ghfast.top/", ""]
+# 加速站若把下载 302 到别的机器，只允许回到 GitHub 自己的下载域名，或加速站自己的主机。
+REDIRECT_HOSTS = {
+    "github.com", "www.github.com", "codeload.github.com",
+    "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+}
+MAX_DOWNLOAD = 1 << 30
+
+
+class _PinnedRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parts = urllib.parse.urlsplit(newurl)
+        host = (parts.hostname or "").lower().rstrip(".")
+        origin = (urllib.parse.urlsplit(req.full_url).hostname or "").lower().rstrip(".")
+        if parts.scheme != "https" or not host or host not in REDIRECT_HOSTS | {origin}:
+            raise urllib.error.HTTPError(newurl, code, "redirect blocked", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 MEME_PACKS = ["anka-afk/blue-fat-fish-meme-pack@v1.0.0", "anka-afk/deepseek-fanart-meme-pack@v1.0.0"]
 DESIGN_TEXT = "哼，你终于想起来找我啦？我还以为你把我忘了呢。今天有没有给我带好吃的呀？"
 # (id, 列表里的名字, 声音描述, 念的台词；None 就用 DESIGN_TEXT)
@@ -49,26 +69,58 @@ VOICE_PRESETS = [
 
 
 def load(path):
-    return json.load(open(path, encoding="utf-8-sig"))
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        sys.exit(f"读不了 {path}：{e}")
+    return data
 
 
 def save(path, data, backup=True):
     if backup and os.path.exists(path):
         shutil.copy2(path, path + ".bak")
-    json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def qq_number(value, label):
+    text = str(value if value is not None else "").strip()
+    # 只接受数字，避免 QQ 号被拼进文件名或命令参数时带上路径、空格或开关。
+    if not text.isdigit() or not 4 <= len(text) <= 20:
+        sys.exit(f"{label} 只能填写数字 QQ 号。")
+    return text
 
 
 def config():
     if not os.path.exists(CONFIG_PATH):
         sys.exit("先把 config.example.json 复制成 config.json，填好 bot_qq。")
     cfg = load(CONFIG_PATH)
-    if not str(cfg.get("bot_qq", "")).strip():
-        sys.exit("config.json 里的 bot_qq（机器人小号）还没填。")
+    if not isinstance(cfg, dict):
+        sys.exit("config.json 的最外层必须是一组配置项。")
+    cfg["bot_qq"] = qq_number(cfg.get("bot_qq"), "config.json 里的 bot_qq（机器人小号）")
     return cfg
 
 
 def path_of(cfg, key, default):
-    return os.path.join(ROOT, os.path.expanduser(cfg.get(key) or default))
+    raw = cfg.get(key) or default
+    if not isinstance(raw, str) or not raw.strip():
+        raw = default
+    return os.path.join(ROOT, os.path.expanduser(raw))
+
+
+def one_line(value):
+    """放进 multipart 正文的文字不能带换行，否则会变成额外的表单字段。"""
+    return str(value).replace("\r", " ").replace("\n", " ")
 
 
 def cmd_config_path(cfg):
@@ -76,7 +128,7 @@ def cmd_config_path(cfg):
 
 
 def link(cfg):
-    bot = str(cfg["bot_qq"]).strip()
+    bot = qq_number(cfg.get("bot_qq"), "config.json 里的 bot_qq（机器人小号）")
     napcat = path_of(cfg, "napcat_dir", "napcat")
     ob_path = os.path.join(napcat, "config", f"onebot11_{bot}.json")
     if not os.path.exists(ob_path):
@@ -148,7 +200,7 @@ def tts(cfg):
 
 def group(cfg, gid):
     gid = str(gid).strip()
-    if not gid.isdigit():
+    if not gid.isdigit() or len(gid) > 20:
         sys.exit("群号只能是数字")
     cp = cmd_config_path(cfg)
     c = load(cp)
@@ -173,24 +225,60 @@ def group(cfg, gid):
     print(f"群 {gid} 已开放。重启 AstrBot 后生效，插嘴频率在控制台的「群聊和语音」页调。")
 
 
+def download_zip(opener, url, target):
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or not parts.hostname:
+        raise ValueError("只接受 https 下载地址")
+    part = target + ".part"
+    total = 0
+    try:
+        with opener.open(url, timeout=60) as r, open(part, "wb") as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                if total == 0 and not chunk.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+                    raise ValueError("下载内容不是 zip")
+                total += len(chunk)
+                if total > MAX_DOWNLOAD:
+                    raise ValueError("压缩包超过 1GB，已中止")
+                f.write(chunk)
+        if total < 22:
+            raise ValueError("压缩包不完整")
+        os.replace(part, target)
+    except Exception:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise
+    return total
+
+
 def memes(cfg):
     out_dir = os.path.join(ROOT, "memes")
     os.makedirs(out_dir, exist_ok=True)
-    opener = urllib.request.build_opener()  # 走系统代理，下得快
+    opener = urllib.request.build_opener(_PinnedRedirect)  # 走系统代理，下得快；跳转只留在 GitHub 或加速站自己的主机
     for spec in MEME_PACKS:
         repo, ref = spec.split("@")
-        target = os.path.join(out_dir, f"{repo.split('/')[1]}-{ref}.zip")
+        repo_name, tag = repo.split("/")[1], ref
+        if not repo_name.replace(".", "").replace("-", "").isalnum() or not tag.replace(".", "").replace("-", "").isalnum():
+            print(f"{spec} 的仓库名或版本号不合法，跳过")
+            continue
+        target = os.path.join(out_dir, f"{repo_name}-{tag}.zip")
         if os.path.exists(target):
             print(f"{os.path.basename(target)} 已有，跳过")
             continue
         url = f"https://github.com/{repo}/archive/{ref}.zip"
         for acc in GH_ACCELERATORS:
+            full = acc + url
+            if urllib.parse.urlsplit(full).scheme != "https":
+                print(f"  跳过非 https 地址：{acc or full}")
+                continue
             try:
                 print(f"下载 {repo}（{acc or '直连 GitHub'}）…", flush=True)
-                with opener.open(acc + url, timeout=60) as r, open(target + ".part", "wb") as f:
-                    shutil.copyfileobj(r, f, 1 << 20)
-                os.replace(target + ".part", target)
-                print(f"  好了：{os.path.getsize(target) // (1 << 20)} MB")
+                size = download_zip(opener, full, target)
+                print(f"  好了：{size // (1 << 20)} MB")
                 break
             except Exception as e:
                 print(f"  失败：{e}")
@@ -229,11 +317,13 @@ def voices(cfg):
             w.setframerate(24000)
             w.writeframes(pcm)
         b = uuid.uuid4().hex
-        parts = b"".join(f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
-                         for k, v in (("ref_text", text), ("name", vid), ("description", desc)))
+        parts = b"".join(
+            f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{one_line(v)}\r\n".encode("utf-8")
+            for k, v in (("ref_text", text), ("name", vid), ("description", desc)))
         head = (f"--{b}\r\nContent-Disposition: form-data; name=\"ref_audio\"; filename=\"ref.wav\"\r\n"
                 "Content-Type: application/octet-stream\r\n\r\n").encode()
-        data = parts + head + open(path, "rb").read() + f"\r\n--{b}--\r\n".encode()
+        with open(path, "rb") as fh:
+            data = parts + head + fh.read() + f"\r\n--{b}--\r\n".encode()
         NO_PROXY.open(urllib.request.Request(BREEZE + "/v1/voices", data,
                                              {"Content-Type": f"multipart/form-data; boundary={b}"}), timeout=120)
         print(f"{label}：做好了")
@@ -241,15 +331,28 @@ def voices(cfg):
     print("在控制台的「声音」页能试听和切换。不满意的可以删掉，在那一页按描述重做。")
 
 
+def run_powershell(script, env):
+    # 路径只放在环境变量里。-Command 后面如果直接拼路径，带引号或 $() 的目录会被当成命令。
+    merged = os.environ.copy()
+    merged.update(env)
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                   env=merged, check=True)
+
+
 def shortcut(cfg):
     pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     icon = path_of(cfg, "icon", "dafeiyu.ico")
-    ps = ("$d=[Environment]::GetFolderPath('Desktop');"
-          "$s=(New-Object -ComObject WScript.Shell).CreateShortcut(\"$d\\大肥鱼控制台.lnk\");"
-          "$s.TargetPath=$args[0];$s.Arguments=$args[1];$s.WorkingDirectory=$args[2];"
-          "if(Test-Path $args[3]){$s.IconLocation=$args[3]};$s.Save()")
-    subprocess.run(["powershell", "-NoProfile", "-Command", ps, pythonw,
-                    f'"{os.path.join(ROOT, "dafeiyu_console.pyw")}"', ROOT, icon], check=True)
+    script = ("$d=[Environment]::GetFolderPath('Desktop');"
+              "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d '大肥鱼控制台.lnk'));"
+              "$s.TargetPath=$env:DFY_TARGET;$s.Arguments=$env:DFY_ARGS;$s.WorkingDirectory=$env:DFY_CWD;"
+              "if($env:DFY_ICON -and (Test-Path -LiteralPath $env:DFY_ICON)){$s.IconLocation=$env:DFY_ICON};"
+              "$s.Save()")
+    run_powershell(script, {
+        "DFY_TARGET": pythonw,
+        "DFY_ARGS": f'"{os.path.join(ROOT, "dafeiyu_console.pyw")}"',
+        "DFY_CWD": ROOT,
+        "DFY_ICON": icon,
+    })
     print("桌面上放好了「大肥鱼控制台」。")
 
 
