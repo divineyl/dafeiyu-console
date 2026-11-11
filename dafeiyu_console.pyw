@@ -14,6 +14,7 @@ import threading
 import time
 import tkinter as tk
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import wave
@@ -38,15 +39,52 @@ DEFAULTS = {
 }
 
 
+TOKEN_OK = re.compile(r"^[A-Za-z0-9._~+/-]{0,256}$")
+CONFIG_ERROR = None
+
+
 def load_config():
+    """读 config.json。文件坏了、QQ 号不是数字、路径不是文字时，先记下来，控制台不启动。"""
+    global CONFIG_ERROR
+    loaded = {}
     try:
-        cfg = {**DEFAULTS, **json.load(open(CONFIG_PATH, encoding="utf-8-sig"))}
+        with open(CONFIG_PATH, encoding="utf-8-sig") as fh:
+            loaded = json.load(fh)
     except FileNotFoundError:
-        cfg = dict(DEFAULTS)
+        loaded = {}
+    except (OSError, json.JSONDecodeError):
+        CONFIG_ERROR = "config.json 打不开，或里面不是合法的 JSON。修好之前控制台不会启动。"
+        loaded = {}
+    if not isinstance(loaded, dict):
+        CONFIG_ERROR = CONFIG_ERROR or "config.json 的最外层必须是一组配置项。"
+        loaded = {}
+    cfg = {**DEFAULTS, **loaded}
+    bot = cfg.get("bot_qq", "")
+    if isinstance(bot, int) and not isinstance(bot, bool):
+        bot = str(bot)
+    if not isinstance(bot, str):
+        CONFIG_ERROR = CONFIG_ERROR or "config.json 里的 bot_qq 只能填写数字 QQ 号。"
+        bot = ""
+    bot = bot.strip()
+    if bot and (not bot.isdigit() or not 4 <= len(bot) <= 20):
+        CONFIG_ERROR = CONFIG_ERROR or "config.json 里的 bot_qq 只能填写数字 QQ 号。"
+        bot = ""
+    cfg["bot_qq"] = bot
     for key in ("qq_exe", "astrbot_exe", "astrbot_dir", "napcat_dir", "breeze_dir", "icon"):
-        # 相对路径按安装目录算
-        cfg[key] = os.path.join(ROOT, os.path.expanduser(cfg[key]))
-    cfg["bot_qq"] = str(cfg["bot_qq"]).strip()
+        raw = cfg.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            CONFIG_ERROR = CONFIG_ERROR or f"config.json 里的 {key} 必须是路径。"
+            raw = DEFAULTS[key]
+        cfg[key] = os.path.join(ROOT, os.path.expanduser(raw))
+    if "breeze_model" in loaded:
+        model = loaded["breeze_model"]
+        # 模型只是文件名，拼在 models 目录下。斜杠、反斜杠和 .. 都会跑到别的目录去。
+        if (not isinstance(model, str) or not model.strip() or model in {".", ".."}
+                or os.path.basename(model) != model or any(c in model for c in "\\/\r\n\x00")):
+            CONFIG_ERROR = CONFIG_ERROR or "config.json 里的 breeze_model 必须是模型文件名，不能带目录。"
+            cfg["breeze_model"] = DEFAULTS["breeze_model"]
+    token = cfg.get("napcat_http_token", "")
+    cfg["napcat_http_token"] = token if isinstance(token, str) else ""
     return cfg
 
 
@@ -69,7 +107,8 @@ VOICE_SETTINGS = os.path.join(ROOT, "voice-settings.json")
 VOICE_TMP = os.path.join(ROOT, "voice-candidates")
 SAMPLE_TEXT = "在呢在呢，这么晚还不睡，是不是又在偷偷吃夜宵？"
 DESIGN_TEXT = "哼，你终于想起来找我啦？我还以为你把我忘了呢。今天有没有给我带好吃的呀？"
-STARTUP_LNK = os.path.join(os.environ["APPDATA"], r"Microsoft\Windows\Start Menu\Programs\Startup\大肥鱼控制台.lnk")
+STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""),
+                           r"Microsoft\Windows\Start Menu\Programs\Startup\大肥鱼控制台.lnk")
 NO_WINDOW = 0x08000000
 NEW_GROUP = 0x00000200
 NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -77,7 +116,11 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def napcat_token():
-    return CFG["napcat_http_token"]
+    tok = CFG.get("napcat_http_token") or ""
+    # 密钥只做请求头。夹带换行的话会变成额外的 HTTP 头，所以对不上就当没配。
+    if not isinstance(tok, str) or not TOKEN_OK.fullmatch(tok):
+        return ""
+    return tok
 
 
 def port_open(port):
@@ -242,13 +285,37 @@ BY_KEY = {s.key: s for s in SERVICES}
 
 
 def load_json(path):
-    return json.load(open(path, encoding="utf-8-sig"))
+    with open(path, encoding="utf-8-sig") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"{os.path.basename(path)} 的最外层必须是一组配置项")
+    return data
 
 
 def save_json(path, data):
     tmp = path + ".tmp"
-    json.dump(data, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def one_line(value):
+    """放进 multipart 的文字不能带换行，否则会多出一段表单。"""
+    return str(value).replace("\r", " ").replace("\n", " ")
+
+
+def voice_api_path(vid):
+    if (not isinstance(vid, str) or not vid or vid in {".", ".."} or "/" in vid or "\\" in vid
+            or any(ord(c) < 32 or ord(c) == 127 for c in vid)):
+        raise ValueError("声音编号不合法")
+    return "/v1/voices/" + urllib.parse.quote(vid, safe="")
 
 
 class App:
@@ -495,8 +562,16 @@ class App:
         body = json.dumps({"model": "tts-1", "voice": voice, "keep_voice": True, "input": text,
                            "response_format": "wav", "speed": round(self.speed.get(), 2)}).encode()
         req = urllib.request.Request("http://127.0.0.1:8138/v1/audio/speech", body, {"Content-Type": "application/json"})
-        with NO_PROXY.open(req, timeout=600) as r:
-            open(out, "wb").write(r.read())
+        total = 0
+        with NO_PROXY.open(req, timeout=600) as r, open(out, "wb") as fh:
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 64 << 20:
+                    raise RuntimeError("试听音频太大")
+                fh.write(chunk)
 
     def use_voice(self):
         vid = self.selected_voice()
@@ -530,7 +605,7 @@ class App:
         if not messagebox.askyesno("删除声音", f"确定删除「{label}」吗？删了就找不回来了。"):
             return
         try:
-            self.breeze("DELETE", f"/v1/voices/{vid}", timeout=10)
+            self.breeze("DELETE", voice_api_path(vid), timeout=10)
         except urllib.error.HTTPError as e:
             self.say(f"删除失败（{e.code}）", "#c33")
             return
@@ -575,11 +650,13 @@ class App:
         name = self.new_name.get().strip() or desc[:8]
         vid = "v" + time.strftime("%m%d%H%M%S")
         b = uuid.uuid4().hex
-        parts = b"".join(f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
-                         for k, v in (("ref_text", DESIGN_TEXT), ("name", vid), ("description", desc)))
+        parts = b"".join(
+            f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{one_line(v)}\r\n".encode("utf-8")
+            for k, v in (("ref_text", DESIGN_TEXT), ("name", vid), ("description", desc)))
         head = (f"--{b}\r\nContent-Disposition: form-data; name=\"ref_audio\"; filename=\"ref.wav\"\r\n"
                 "Content-Type: application/octet-stream\r\n\r\n").encode()
-        body = parts + head + open(path, "rb").read() + f"\r\n--{b}--\r\n".encode()
+        with open(path, "rb") as fh:
+            body = parts + head + fh.read() + f"\r\n--{b}--\r\n".encode()
         self.breeze("POST", "/v1/voices", body, f"multipart/form-data; boundary={b}", timeout=120)
         vs = self.voice_settings()
         vs.setdefault("labels", {})[vid] = name
@@ -703,12 +780,26 @@ class App:
 
     def toggle_autostart(self):
         if self.autostart_var.get():
-            ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($args[0]);"
-                  "$s.TargetPath=$args[1];$s.Arguments=$args[2];$s.WorkingDirectory=$args[3];"
-                  "$s.IconLocation=$args[4];$s.Save()")
-            subprocess.run(["powershell", "-NoProfile", "-Command", ps, STARTUP_LNK, sys.executable,
-                            f'"{os.path.abspath(__file__)}" --autostart', os.path.dirname(__file__), ICON],
-                           creationflags=NO_WINDOW)
+            # 路径放在环境变量里，避免目录名里的引号或 $() 被 PowerShell 当成命令。
+            script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut($env:DFY_LNK);"
+                      "$s.TargetPath=$env:DFY_TARGET;$s.Arguments=$env:DFY_ARGS;$s.WorkingDirectory=$env:DFY_CWD;"
+                      "if($env:DFY_ICON -and (Test-Path -LiteralPath $env:DFY_ICON)){$s.IconLocation=$env:DFY_ICON};"
+                      "$s.Save()")
+            env = os.environ.copy()
+            env.update({
+                "DFY_LNK": STARTUP_LNK,
+                "DFY_TARGET": sys.executable,
+                "DFY_ARGS": f'"{os.path.abspath(__file__)}" --autostart',
+                "DFY_CWD": os.path.dirname(os.path.abspath(__file__)),
+                "DFY_ICON": ICON,
+            })
+            try:
+                subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                               env=env, creationflags=NO_WINDOW, check=True)
+            except (OSError, subprocess.CalledProcessError):
+                self.autostart_var.set(False)
+                self.say("开机启动没能写上，看看 PowerShell 是否可用", "#c33")
+                return
             self.say("已设置开机自动启动")
         else:
             try:
@@ -790,6 +881,10 @@ def main():
     except OSError:
         tk.Tk().withdraw()
         messagebox.showinfo("大肥鱼控制台", "控制台已经开着了，看看任务栏。")
+        return
+    if CONFIG_ERROR:
+        tk.Tk().withdraw()
+        messagebox.showwarning("大肥鱼控制台", CONFIG_ERROR)
         return
     if not BOT_QQ:
         tk.Tk().withdraw()
